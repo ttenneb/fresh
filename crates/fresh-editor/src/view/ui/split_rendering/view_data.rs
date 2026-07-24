@@ -333,6 +333,7 @@ pub(super) fn build_view_data(
             state.conceals.version(),
             state.virtual_texts.version(),
         );
+        let tab_size = state.buffer_settings.tab_size as u16;
         let make_key = |line_start: usize, mode: CacheViewMode, cursor_sig: u64| LineWrapKey {
             pipeline_inputs_version: pipeline_inputs_ver,
             view_mode: mode,
@@ -343,6 +344,7 @@ pub(super) fn build_view_data(
             hanging_indent,
             line_wrap_enabled: true,
             grid_wrap: viewport.grid_wrap,
+            tab_size,
             cursor_sig,
         };
 
@@ -508,6 +510,20 @@ fn try_cached_window(
     // yields at most MAX_LINE_BYTES per call, so a huge line arrives as
     // several segments — only a segment following a newline starts a
     // new logical line.
+    //
+    // The walk is byte-bounded to what the full pipeline would tokenise:
+    // `build_base_tokens` spends its `max_lines` budget at one "line"
+    // per MAX_SAFE_LINE_WIDTH chars inside a huge line, so a window
+    // whose lines total more than that yields truncated cache entries
+    // the completeness check below rejects anyway.  Without this cap
+    // the walk would read an arbitrarily large single line end-to-end
+    // (unbounded disk I/O on lazily-loaded large files) only to
+    // conclude "fall back".  ×4 converts the char budget to a byte
+    // bound that can't under-count multi-byte text.
+    let max_walk_bytes = max_lines
+        .saturating_mul(MAX_SAFE_LINE_WIDTH)
+        .saturating_mul(4);
+    let mut walked_bytes = 0usize;
     let mut starts: Vec<usize> = Vec::with_capacity(max_lines.min(64));
     let mut prev_ended_with_newline = true;
     let mut last_crlf = false;
@@ -538,6 +554,10 @@ fn try_cached_window(
                 }
                 starts.push(start);
             }
+            walked_bytes += content.len();
+            if walked_bytes > max_walk_bytes {
+                return None;
+            }
             prev_ended_with_newline = content.ends_with('\n');
             last_crlf = content.ends_with("\r\n");
         }
@@ -567,6 +587,7 @@ fn try_cached_window(
     } else {
         CacheViewMode::Source
     };
+    let tab_size = state.buffer_settings.tab_size as u16;
     let make_key = |line_start: usize| LineWrapKey {
         pipeline_inputs_version: version,
         view_mode: cache_view_mode,
@@ -579,6 +600,7 @@ fn try_cached_window(
         // The fast path is gated off under terminal grid-wrap (see the
         // eligibility check at the call site).
         grid_wrap: false,
+        tab_size,
         cursor_sig: 0,
     };
 

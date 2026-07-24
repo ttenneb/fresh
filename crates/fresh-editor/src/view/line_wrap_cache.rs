@@ -88,6 +88,13 @@ pub struct LineWrapKey {
     /// buffers set this; it keys separately from word-wrap entries at the
     /// same geometry.
     pub grid_wrap: bool,
+    /// Tab width the pipeline renders `\t` at (`buffer_settings.tab_size`).
+    /// A layout input like the geometry fields: changing it (e.g. the
+    /// `set tab_size` command) reshapes visual columns and wrap points
+    /// without bumping any pipeline-inputs version, so it must key the
+    /// entry or the renderer's cached-window fast path would serve
+    /// stale layouts after a tab-size change.
+    pub tab_size: u16,
     /// Signature of the cursor positions inside this line (see
     /// [`cursor_sig_for_line`]). Cursor-dependent conceal/soft-break
     /// activation makes the cursor line's layout a function of where the
@@ -542,6 +549,8 @@ pub struct WrapGeometry {
     /// breaks at `effective_width`, ignoring `gutter_width` /
     /// `hanging_indent` / `wrap_column`.
     pub grid_wrap: bool,
+    /// Tab width (see [`LineWrapKey::tab_size`]).
+    pub tab_size: usize,
     pub view_mode: CacheViewMode,
 }
 
@@ -566,6 +575,7 @@ impl WrapGeometry {
             hanging_indent: self.hanging_indent,
             line_wrap_enabled: self.line_wrap_enabled,
             grid_wrap: self.grid_wrap,
+            tab_size: self.tab_size as u16,
             cursor_sig,
         }
     }
@@ -1068,6 +1078,7 @@ mod tests {
             hanging_indent: false,
             line_wrap_enabled: true,
             grid_wrap: false,
+            tab_size: 4,
             cursor_sig: 0,
         }
     }
@@ -1667,6 +1678,7 @@ mod tests {
                 hanging_indent: false,
                 line_wrap_enabled: true,
                 grid_wrap: false,
+                tab_size: 4,
                 cursor_sig: 0,
             };
             let real_val = real.get_or_insert_with(key, || dummy_lines(shadow_rows));
@@ -1701,6 +1713,7 @@ mod tests {
             hanging_indent: false,
             line_wrap_enabled: true,
             grid_wrap: false,
+            tab_size: 4,
             cursor_sig: 0,
         };
         cache.get_or_insert_with(key_v0, || dummy_lines(5));
@@ -1745,11 +1758,12 @@ mod tests {
             hanging_indent: false,
             line_wrap_enabled: true,
             grid_wrap: false,
+            tab_size: 4,
             cursor_sig: 0,
         };
 
         // Vary each field in turn; each variation must be a distinct key.
-        let variations: [LineWrapKey; 9] = [
+        let variations: [LineWrapKey; 10] = [
             LineWrapKey {
                 pipeline_inputs_version: 2,
                 ..base
@@ -1785,6 +1799,10 @@ mod tests {
             },
             LineWrapKey {
                 grid_wrap: true,
+                ..base
+            },
+            LineWrapKey {
+                tab_size: 8,
                 ..base
             },
         ];
