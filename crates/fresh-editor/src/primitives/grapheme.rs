@@ -9,7 +9,20 @@
 //! A grapheme cluster is what a user perceives as a single character.
 //! For example, Thai "ที่" looks like one character but is 3 Unicode code points.
 
-use unicode_segmentation::UnicodeSegmentation;
+use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
+
+/// Snap `pos` down to a UTF-8 code-point boundary so it can be handed to
+/// [`GraphemeCursor`], which requires boundary-aligned offsets. A position
+/// inside a code point can never be a grapheme boundary, so snapping down
+/// preserves the semantics of every caller below.
+#[inline]
+fn snap_to_char_boundary(s: &str, mut pos: usize) -> usize {
+    pos = pos.min(s.len());
+    while pos > 0 && !s.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
+}
 
 /// Find the byte position of the previous grapheme cluster boundary.
 ///
@@ -28,18 +41,16 @@ pub fn prev_grapheme_boundary(s: &str, pos: usize) -> usize {
         return 0;
     }
 
-    let pos = pos.min(s.len());
-
-    // Find all grapheme boundaries up to our position
-    let mut last_boundary = 0;
-    for (idx, _) in s.grapheme_indices(true) {
-        if idx >= pos {
-            break;
-        }
-        last_boundary = idx;
+    // A mid-code-point position snaps down; the nearest boundary strictly
+    // before it is the containing cluster's start, same as before snapping.
+    let pos = snap_to_char_boundary(s, pos);
+    if pos == 0 {
+        return 0;
     }
-
-    last_boundary
+    let mut cursor = GraphemeCursor::new(pos, s.len(), true);
+    // With the whole string as a single chunk (chunk_start == 0) the cursor
+    // never needs pre-context, so this cannot fail.
+    cursor.prev_boundary(s, 0).ok().flatten().unwrap_or(0)
 }
 
 /// Find the byte position of the next grapheme cluster boundary.
@@ -59,20 +70,11 @@ pub fn next_grapheme_boundary(s: &str, pos: usize) -> usize {
         return s.len();
     }
 
-    // Find the grapheme that contains our position, then return its end
-    for (idx, grapheme) in s.grapheme_indices(true) {
-        let end = idx + grapheme.len();
-        if idx >= pos {
-            // This grapheme starts at or after our position
-            return end;
-        }
-        if end > pos {
-            // Our position is within this grapheme
-            return end;
-        }
-    }
-
-    s.len()
+    // A mid-cluster position (snapped or not) advances to the end of the
+    // containing cluster — the next boundary after it.
+    let pos = snap_to_char_boundary(s, pos);
+    let mut cursor = GraphemeCursor::new(pos, s.len(), true);
+    cursor.next_boundary(s, 0).ok().flatten().unwrap_or(s.len())
 }
 
 /// Get the grapheme cluster at the given position.
@@ -87,14 +89,9 @@ pub fn grapheme_at(s: &str, pos: usize) -> Option<(&str, usize, usize)> {
         return None;
     }
 
-    for (idx, grapheme) in s.grapheme_indices(true) {
-        let end = idx + grapheme.len();
-        if idx <= pos && pos < end {
-            return Some((grapheme, idx, end));
-        }
-    }
-
-    None
+    let start = snap_to_grapheme_boundary(s, pos);
+    let end = next_grapheme_boundary(s, start);
+    Some((&s[start..end], start, end))
 }
 
 /// Snap a byte position **down** to the nearest grapheme-cluster
@@ -120,17 +117,13 @@ pub fn snap_to_grapheme_boundary(s: &str, pos: usize) -> usize {
     if pos >= s.len() {
         return s.len();
     }
-    let mut last_boundary = 0;
-    for (idx, _) in s.grapheme_indices(true) {
-        if idx == pos {
-            return pos;
-        }
-        if idx > pos {
-            break;
-        }
-        last_boundary = idx;
+    let pos = snap_to_char_boundary(s, pos);
+    let mut cursor = GraphemeCursor::new(pos, s.len(), true);
+    match cursor.is_boundary(s, 0) {
+        Ok(true) => pos,
+        // Not a boundary → start of the containing cluster.
+        _ => cursor.prev_boundary(s, 0).ok().flatten().unwrap_or(0),
     }
-    last_boundary
 }
 
 /// Count the number of grapheme clusters in a string.

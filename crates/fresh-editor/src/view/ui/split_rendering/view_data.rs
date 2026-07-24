@@ -74,6 +74,79 @@ pub(super) fn build_view_data(
     // depth for any tokens produced by plugin view transforms).
     let fold_skip = fold_skip_set(&state.buffer, &state.marker_list, folds);
 
+    // Wrap geometry, computed up-front so both the cached-window fast
+    // path and the full pipeline (and its cache writeback) agree on it.
+    //
+    // When line_wrap is on: wrap at viewport width (or wrap_column if
+    // set), reserving the last content column so the end-of-line cursor
+    // never lands on top of the vertical scrollbar (the cursor sits one
+    // column past the last rendered character, so a row that fills
+    // `content_width` exactly would place the EOL cursor on the
+    // scrollbar track).  `saturating_sub` keeps this safe at very small
+    // widths where the guard inside `apply_wrapping_transform` will
+    // short-circuit anyway.  When line_wrap is off: wrap at
+    // MAX_SAFE_LINE_WIDTH to prevent memory exhaustion from extremely
+    // long lines.
+    let effective_width = if line_wrap_enabled {
+        if viewport.grid_wrap {
+            // Terminal-grid wrap (fresh#2649): wrap at exactly the
+            // capture-time PTY column count. No EOL-cursor column is
+            // reserved and no clamp to the content width — the grid is one
+            // column wider than the scroll-back content area (the live view
+            // reclaims the scrollbar column), and clamping or reserving
+            // would re-wrap every full-width grid row one cell early,
+            // reflowing the whole view on entry. Full rows render with
+            // their last cell under the scrollbar, exactly like the
+            // non-wrapped exit frame always has.
+            viewport.grid_cols()
+        } else {
+            let base = if let Some(col) = viewport.wrap_column {
+                col.min(content_width)
+            } else {
+                content_width
+            };
+            base.saturating_sub(1).max(1)
+        }
+    } else {
+        MAX_SAFE_LINE_WIDTH
+    };
+    let hanging_indent = line_wrap_enabled && viewport.wrap_indent && !viewport.grid_wrap;
+    let is_compose = matches!(view_mode, ViewMode::PageView);
+
+    // Fast path: when the pipeline's output for this window is fully
+    // determined by per-line layouts already in the line-wrap cache,
+    // assemble the window from those entries instead of re-tokenising
+    // and re-wrapping every visible logical line.  This is what makes
+    // cursor movement inside a very long wrapped line responsive: the
+    // full pipeline is O(line length) per frame, while a warm cache
+    // walk is O(visible rows).  Eligibility mirrors the writeback
+    // conditions below, plus cursor-independence (no soft breaks /
+    // conceals) so entries keyed `cursor_sig: 0` are exact.  Any miss
+    // or stale entry falls through to the full pipeline, whose
+    // writeback repopulates the cache for the next frame.
+    if view_transform.is_none()
+        && line_wrap_enabled
+        && !viewport.grid_wrap
+        && !is_binary
+        && fold_skip.is_empty()
+        && state.virtual_texts.is_empty()
+        && state.soft_breaks.is_empty()
+        && state.conceals.is_empty()
+    {
+        if let Some(lines) = try_cached_window(
+            state,
+            viewport,
+            estimated_line_length,
+            adjusted_visible_count,
+            effective_width,
+            gutter_width,
+            hanging_indent,
+            is_compose,
+        ) {
+            return ViewData { lines };
+        }
+    }
+
     // Build base token stream from source, skipping any source-byte range
     // that falls inside a collapsed fold.
     let base_tokens = build_base_tokens(
@@ -93,7 +166,6 @@ pub(super) fn build_view_data(
     // Apply soft breaks — marker-based line wrapping that survives edits
     // without flicker. Only apply in Compose mode; Source mode shows the raw
     // unwrapped text.
-    let is_compose = matches!(view_mode, ViewMode::PageView);
     if is_compose && !state.soft_breaks.is_empty() {
         let viewport_end = tokens
             .iter()
@@ -140,45 +212,6 @@ pub(super) fn build_view_data(
             tokens = apply_conceal_ranges(tokens, &conceal_ranges);
         }
     }
-
-    // Apply wrapping transform - always enabled for safety, but with
-    // different thresholds. When line_wrap is on: wrap at viewport width (or
-    // wrap_column if set). When line_wrap is off: wrap at
-    // MAX_SAFE_LINE_WIDTH to prevent memory exhaustion from extremely long
-    // lines.
-    //
-    // When wrapping is on, reserve the last content column so the
-    // end-of-line cursor never lands on top of the vertical scrollbar.
-    // The cursor sits one column past the last rendered character, so
-    // a row that fills `content_width` exactly would place the EOL
-    // cursor on the scrollbar track (which is drawn in the column
-    // immediately to the right of the content area).  `saturating_sub`
-    // keeps this safe at very small widths where the guard inside
-    // `apply_wrapping_transform` will short-circuit anyway.
-    let effective_width = if line_wrap_enabled {
-        if viewport.grid_wrap {
-            // Terminal-grid wrap (fresh#2649): wrap at exactly the
-            // capture-time PTY column count. No EOL-cursor column is
-            // reserved and no clamp to the content width — the grid is one
-            // column wider than the scroll-back content area (the live view
-            // reclaims the scrollbar column), and clamping or reserving
-            // would re-wrap every full-width grid row one cell early,
-            // reflowing the whole view on entry. Full rows render with
-            // their last cell under the scrollbar, exactly like the
-            // non-wrapped exit frame always has.
-            viewport.grid_cols()
-        } else {
-            let base = if let Some(col) = viewport.wrap_column {
-                col.min(content_width)
-            } else {
-                content_width
-            };
-            base.saturating_sub(1).max(1)
-        }
-    } else {
-        MAX_SAFE_LINE_WIDTH
-    };
-    let hanging_indent = line_wrap_enabled && viewport.wrap_indent && !viewport.grid_wrap;
 
     // Splice inline virtual text (inlay hints) into the stream BEFORE
     // wrapping so its display width participates in wrap boundaries, the
@@ -273,11 +306,22 @@ pub(super) fn build_view_data(
         && state.virtual_texts.is_empty()
     {
         use crate::view::line_wrap_cache::{
-            cursor_sig_for_line, pipeline_inputs_version, CacheViewMode, LineWrapKey,
+            cursor_sig_for_line, layout_depends_on_cursors, pipeline_inputs_version, CacheViewMode,
+            LineWrapKey,
         };
         use crate::view::ui::view_pipeline::LineStart;
         use std::sync::Arc;
 
+        // When the pipeline is cursor-independent (no soft breaks or
+        // conceals), key every line with `cursor_sig: 0`: the layout
+        // cannot differ by cursor position, and a stable key keeps the
+        // cursor line's entry valid as the cursor moves within it (the
+        // cached-window fast path above depends on this).
+        let sig_cursors: &[usize] = if layout_depends_on_cursors(state) {
+            cursor_positions
+        } else {
+            &[]
+        };
         let cache_view_mode = if matches!(view_mode, ViewMode::PageView) {
             CacheViewMode::Compose
         } else {
@@ -361,7 +405,7 @@ pub(super) fn build_view_data(
                     .max()
                     .map(|b| b + 1)
                     .unwrap_or(line_start_byte);
-                let cursor_sig = cursor_sig_for_line(cursor_positions, line_start_byte, sig_end);
+                let cursor_sig = cursor_sig_for_line(sig_cursors, line_start_byte, sig_end);
                 let arc = Arc::new(slice);
                 state.line_wrap_cache.put(
                     make_key(line_start_byte, cache_view_mode, cursor_sig),
@@ -420,4 +464,164 @@ pub(super) fn build_view_data(
     );
 
     ViewData { lines }
+}
+
+/// Assemble the visible window straight from per-line entries in the
+/// line-wrap cache.
+///
+/// Returns `Some(lines)` only when every logical line the window needs
+/// (plus the trailing empty EOF line, when applicable) has a complete
+/// cached layout under the current pipeline-inputs version and
+/// geometry; otherwise returns `None` and the caller runs the full
+/// pipeline, whose writeback repopulates the cache so the next frame
+/// hits.
+///
+/// Caller must guarantee (checked at the call site): no plugin view
+/// transform, line wrap on, non-binary buffer, no folds, and empty
+/// virtual-text / soft-break / conceal managers — the exact conditions
+/// under which the writeback in `build_view_data` stores entries whose
+/// content matches the full pipeline's output and is keyed with
+/// `cursor_sig: 0`.
+fn try_cached_window(
+    state: &mut EditorState,
+    viewport: &Viewport,
+    estimated_line_length: usize,
+    visible_count: usize,
+    effective_width: usize,
+    gutter_width: usize,
+    hanging_indent: bool,
+    is_compose: bool,
+) -> Option<Vec<ViewLine>> {
+    let _span = tracing::trace_span!("try_cached_window").entered();
+    use crate::view::line_wrap_cache::{pipeline_inputs_version, CacheViewMode, LineWrapKey};
+    use crate::view::ui::view_pipeline::LineStart;
+
+    let buffer_len = state.buffer.len();
+    if buffer_len == 0 {
+        return None;
+    }
+    // Mirror `build_base_tokens`' `max_lines` so the assembled window
+    // covers at least every logical line the full pipeline would emit.
+    let max_lines = visible_count.saturating_add(4);
+
+    // Walk logical-line boundaries covering the window.  `next_line`
+    // yields at most MAX_LINE_BYTES per call, so a huge line arrives as
+    // several segments — only a segment following a newline starts a
+    // new logical line.
+    let mut starts: Vec<usize> = Vec::with_capacity(max_lines.min(64));
+    let mut prev_ended_with_newline = true;
+    let mut last_crlf = false;
+    let mut reached_eof = false;
+    // First byte past the window: the start of the first line NOT
+    // included, or `buffer_len` when the window covers up to EOF.
+    let mut end_bound = buffer_len;
+    {
+        let mut iter = state
+            .buffer
+            .line_iterator(viewport.top_byte, estimated_line_length);
+        loop {
+            let Some((start, content)) = iter.next_line() else {
+                reached_eof = true;
+                break;
+            };
+            if start >= buffer_len {
+                // The iterator's synthesized trailing empty line after a
+                // final newline; represented in the cache by its own
+                // entry, handled below.
+                reached_eof = true;
+                break;
+            }
+            if prev_ended_with_newline {
+                if starts.len() == max_lines {
+                    end_bound = start;
+                    break;
+                }
+                starts.push(start);
+            }
+            prev_ended_with_newline = content.ends_with('\n');
+            last_crlf = content.ends_with("\r\n");
+        }
+    }
+    if starts.is_empty() {
+        return None;
+    }
+    // The trailing empty EOF row's cache key: the byte just past the
+    // final Newline *token* (which sits on the `\r` for CRLF), matching
+    // the `source_start_byte` the ViewLineIterator gives that row.
+    let trailing_key_start = (reached_eof && prev_ended_with_newline).then(|| {
+        if last_crlf {
+            buffer_len - 1
+        } else {
+            buffer_len
+        }
+    });
+
+    let version = pipeline_inputs_version(
+        state.buffer.version(),
+        state.soft_breaks.version(),
+        state.conceals.version(),
+        state.virtual_texts.version(),
+    );
+    let cache_view_mode = if is_compose {
+        CacheViewMode::Compose
+    } else {
+        CacheViewMode::Source
+    };
+    let make_key = |line_start: usize| LineWrapKey {
+        pipeline_inputs_version: version,
+        view_mode: cache_view_mode,
+        line_start,
+        effective_width: effective_width as u32,
+        gutter_width: gutter_width as u16,
+        wrap_column: viewport.wrap_column.map(|c| c as u32),
+        hanging_indent,
+        line_wrap_enabled: true,
+        // The fast path is gated off under terminal grid-wrap (see the
+        // eligibility check at the call site).
+        grid_wrap: false,
+        cursor_sig: 0,
+    };
+
+    let mut entries = Vec::with_capacity(starts.len() + 1);
+    for (i, &line_start) in starts.iter().enumerate() {
+        let arc = state.line_wrap_cache.get_touch(&make_key(line_start))?;
+        // Reject entries truncated by the huge-line safety caps
+        // (`MAX_SAFE_LINE_WIDTH` segment budget in `build_base_tokens`,
+        // `max_lines` in `compute_line_layout`): a complete layout's
+        // last row reaches the logical line's final byte.  The -2 slack
+        // covers CRLF, whose Newline token sits on the `\r`.
+        let expected_end = starts.get(i + 1).copied().unwrap_or(end_bound);
+        let last_src = arc
+            .last()
+            .and_then(|row| row.char_source_bytes.iter().rev().find_map(|b| *b));
+        match last_src {
+            Some(b) if b + 2 >= expected_end => {}
+            _ => return None,
+        }
+        entries.push(arc);
+    }
+    if let Some(trailing_start) = trailing_key_start {
+        entries.push(state.line_wrap_cache.get_touch(&make_key(trailing_start))?);
+    }
+
+    // Assemble, normalizing each entry's first-row `line_start` to its
+    // position in THIS window (an entry written while its line was at
+    // the top of the window carries `Beginning`; reused mid-window it
+    // must read `AfterSourceNewline`, and vice versa).
+    let total_rows = entries.iter().map(|e| e.len()).sum();
+    let mut lines: Vec<ViewLine> = Vec::with_capacity(total_rows);
+    for (i, entry) in entries.iter().enumerate() {
+        let first_row = lines.len();
+        lines.extend(entry.iter().cloned());
+        if let Some(row) = lines.get_mut(first_row) {
+            if !matches!(row.line_start, LineStart::AfterBreak) {
+                row.line_start = if i == 0 {
+                    LineStart::Beginning
+                } else {
+                    LineStart::AfterSourceNewline
+                };
+            }
+        }
+    }
+    Some(lines)
 }
