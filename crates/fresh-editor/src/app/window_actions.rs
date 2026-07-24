@@ -1424,6 +1424,11 @@ impl crate::app::Editor {
             crate::services::authority::SessionAuthoritySpec::RemoteAgent(s) => s.clone(),
             _ => return,
         };
+        // Captured while the descriptor borrow is live; used below to prewarm
+        // this session's persisted buffers (the `#[cfg(feature = "plugins")]`
+        // block reads it, so bind it unconditionally to keep the non-plugin
+        // build warning-clean).
+        let _dormant_root = descriptor.root.clone();
         let request_id = u64::MAX - id.0;
         if self.remote_attach_inflight.contains(&request_id) {
             return; // a connect for this session is already in flight
@@ -1440,10 +1445,19 @@ impl crate::app::Editor {
         // remote connect machinery is plugins-gated (dormant remote sessions are
         // created through the orchestrator plugin); without it there is nothing
         // to connect through, so diving into one is a no-op.
+        //
+        // Prewarm the session's persisted buffers on the connect worker so the
+        // promote-time restore reads them from cache instead of blocking the
+        // editor loop on the slow link — that main-thread stall is the dock
+        // freeze this fixes. The connect resolves the root, so pass the paths
+        // relative to the descriptor root captured above.
         #[cfg(feature = "plugins")]
-        self.start_remote_connect(spec, Some(id), request_id);
+        {
+            let prewarm_paths = self.dormant_workspace_prewarm_paths(&_dormant_root);
+            self.start_remote_connect_prewarming(spec, Some(id), request_id, prewarm_paths);
+        }
         #[cfg(not(feature = "plugins"))]
-        let _ = (spec, request_id);
+        let _ = (spec, request_id, _dormant_root);
     }
 
     /// Promote a dormant remote session to a live `Window`, **born with the
@@ -1506,6 +1520,11 @@ impl crate::app::Editor {
                 w
             }
         };
+        // The workspace files were served from the connect-worker prewarm cache
+        // (see `start_remote_connect_prewarming`); drop it now so later reads of
+        // these paths (auto-revert, save, reopen) go back to the live backend
+        // instead of returning a snapshot frozen at connect time.
+        window.authority().filesystem.clear_prewarm();
         window.terminal_width = self.terminal_width;
         window.terminal_height = self.terminal_height;
         window.plugin_state = descriptor.plugin_state.clone();

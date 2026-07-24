@@ -1103,6 +1103,7 @@ pub async fn connect_ssh_authority(
     trust: Arc<WorkspaceTrust>,
     env: Arc<crate::services::env_provider::EnvProvider>,
     cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+    prewarm_paths: Vec<std::path::PathBuf>,
 ) -> Result<(Authority, SshKeepalive), SshError> {
     type Built = Result<
         (
@@ -1163,6 +1164,14 @@ pub async fn connect_ssh_authority(
                     remote_fs.prime_sys_info().await.map_err(|e| {
                         SshError::AgentStartFailed(format!("remote agent is not responding: {e}"))
                     })?;
+                    // Warm this session's persisted buffers into the filesystem's
+                    // read cache, still on the connect worker. Materializing the
+                    // session (reopening those buffers) then serves them from
+                    // memory instead of re-reading over the link on the editor
+                    // loop — the stall that froze the dock when navigating onto a
+                    // slow/high-latency SSH host. Best-effort and never gates the
+                    // connect: an empty list (the common case) is a no-op.
+                    remote_fs.prewarm_paths_async(&prewarm_paths).await;
                     let reconnect =
                         spawn_reconnect_task(connection.channel(), connection.params().clone());
                     Ok::<_, SshError>((connection, remote_fs, reconnect))

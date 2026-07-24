@@ -32,6 +32,23 @@ struct RemoteSysInfo {
     temp_dir: PathBuf,
 }
 
+/// A short-lived read cache used to materialize a freshly-connected session's
+/// workspace without blocking the editor thread. Populated off the hot path by
+/// [`RemoteFileSystem::prewarm_paths_async`] (on the connect worker) and
+/// consulted by the read/stat/canonicalize accessors, then dropped by
+/// `clear_prewarm` once the restore has consumed it. Empty in the steady state,
+/// so it adds only a lock + miss to every op while warm and nothing once
+/// cleared.
+#[derive(Default)]
+struct PrewarmCache {
+    /// Full file content, keyed by both the requested and canonical path.
+    content: std::collections::HashMap<PathBuf, Vec<u8>>,
+    /// `metadata` results (follow-symlink stat).
+    meta: std::collections::HashMap<PathBuf, FileMetadata>,
+    /// `canonicalize` results.
+    canon: std::collections::HashMap<PathBuf, PathBuf>,
+}
+
 /// Remote filesystem that communicates with the Python agent
 pub struct RemoteFileSystem {
     channel: Arc<AgentChannel>,
@@ -42,6 +59,11 @@ pub struct RemoteFileSystem {
     /// thereafter so the editor-thread accessors that need `$HOME` / the temp
     /// dir don't issue a blocking round-trip on the hot path.
     sys_info: Arc<OnceLock<RemoteSysInfo>>,
+    /// Short-lived materialization read cache (see [`PrewarmCache`]). Wrapped in
+    /// a `Mutex` because the connect worker populates it while the editor thread
+    /// may read it; empty except during the window between a dive's prewarm and
+    /// its restore.
+    prewarm: Arc<std::sync::Mutex<PrewarmCache>>,
 }
 
 impl RemoteFileSystem {
@@ -51,6 +73,7 @@ impl RemoteFileSystem {
             channel,
             connection_string,
             sys_info: Arc::new(OnceLock::new()),
+            prewarm: Arc::new(std::sync::Mutex::new(PrewarmCache::default())),
         }
     }
 
@@ -106,6 +129,94 @@ impl RemoteFileSystem {
         #[allow(clippy::let_underscore_must_use)]
         let _ = self.sys_info.set(info.clone());
         Some(info)
+    }
+
+    /// Prewarmed full content for `path`, if the materialization cache holds it.
+    fn prewarm_content(&self, path: &Path) -> Option<Vec<u8>> {
+        self.prewarm.lock().unwrap().content.get(path).cloned()
+    }
+
+    /// Prewarmed `metadata` result for `path`, if cached.
+    fn prewarm_meta(&self, path: &Path) -> Option<FileMetadata> {
+        self.prewarm.lock().unwrap().meta.get(path).cloned()
+    }
+
+    /// Prewarmed `canonicalize` result for `path`, if cached.
+    fn prewarm_canon(&self, path: &Path) -> Option<PathBuf> {
+        self.prewarm.lock().unwrap().canon.get(path).cloned()
+    }
+
+    /// Warm the read cache for `paths` — a freshly-connected session's persisted
+    /// buffers — by fetching each one's canonical form, metadata and full
+    /// content **asynchronously**, so a later editor-thread restore serves them
+    /// from memory instead of blocking on the (possibly slow) link.
+    ///
+    /// Awaited on the connect worker's runtime (inside `connect_ssh_authority`),
+    /// *before* the authority is handed to the editor — so it uses the async
+    /// channel API (never `block_on`, which would panic here) and the editor
+    /// loop is never involved. Each result is stashed under both the requested
+    /// and the canonical path, matching how the restore canonicalizes then stats
+    /// and reads. Best-effort: a path that errors is simply left uncached, and
+    /// the restore falls through to a live read that surfaces the real error.
+    pub async fn prewarm_paths_async(&self, paths: &[PathBuf]) {
+        for path in paths {
+            let path_str = path.to_string_lossy().to_string();
+
+            let canon = self
+                .channel
+                .request("realpath", serde_json::json!({ "path": path_str }))
+                .await
+                .ok()
+                .and_then(|r| r.get("path").and_then(|v| v.as_str()).map(PathBuf::from));
+            let keys: Vec<PathBuf> = match &canon {
+                Some(c) if c != path => vec![path.clone(), c.clone()],
+                _ => vec![path.clone()],
+            };
+            if let Some(c) = &canon {
+                self.prewarm
+                    .lock()
+                    .unwrap()
+                    .canon
+                    .insert(path.clone(), c.clone());
+            }
+
+            if let Ok(result) = self
+                .channel
+                .request("stat", stat_params(&path_str, true))
+                .await
+            {
+                if let Ok(rm) = serde_json::from_value::<RemoteMetadata>(result) {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let meta = Self::convert_metadata(&rm, &name);
+                    let mut cache = self.prewarm.lock().unwrap();
+                    for k in &keys {
+                        cache.meta.insert(k.clone(), meta.clone());
+                    }
+                }
+            }
+
+            if let Ok((chunks, _result)) = self
+                .channel
+                .request_with_data("read", read_params(&path_str, None, None))
+                .await
+            {
+                let mut content = Vec::new();
+                for chunk in chunks {
+                    if let Some(b64) = chunk.get("data").and_then(|v| v.as_str()) {
+                        if let Ok(decoded) = decode_base64(b64) {
+                            content.extend(decoded);
+                        }
+                    }
+                }
+                let mut cache = self.prewarm.lock().unwrap();
+                for k in &keys {
+                    cache.content.insert(k.clone(), content.clone());
+                }
+            }
+        }
     }
 
     /// Get the connection string for display
@@ -228,6 +339,13 @@ impl RemoteFileSystem {
 
 impl FileSystem for RemoteFileSystem {
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
+        // Serve from the materialization prewarm cache when warm, so reopening
+        // a freshly-connected session's persisted buffers never blocks the
+        // editor thread on the slow link (the connect worker already fetched
+        // the bytes). A cold cache falls straight through to the live read.
+        if let Some(content) = self.prewarm_content(path) {
+            return Ok(content);
+        }
         let path_str = path.to_string_lossy();
         let (data_chunks, _result) = self
             .channel
@@ -248,6 +366,26 @@ impl FileSystem for RemoteFileSystem {
     }
 
     fn read_range(&self, path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        // Slice the prewarmed content when warm (same rationale as `read_file`).
+        // Preserve the live path's short-read semantics: a range beyond the
+        // cached bytes is an `UnexpectedEof`, not a silent truncation.
+        if let Some(content) = self.prewarm_content(path) {
+            let start = offset as usize;
+            let end = start.saturating_add(len);
+            if end <= content.len() {
+                return Ok(content[start..end].to_vec());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "read_range: expected {} bytes at offset {}, cached file is {} bytes (path: {})",
+                    len,
+                    offset,
+                    content.len(),
+                    path.to_string_lossy(),
+                ),
+            ));
+        }
         let path_str = path.to_string_lossy();
         let (data_chunks, result) = self
             .channel
@@ -420,6 +558,9 @@ impl FileSystem for RemoteFileSystem {
     }
 
     fn metadata(&self, path: &Path) -> io::Result<FileMetadata> {
+        if let Some(meta) = self.prewarm_meta(path) {
+            return Ok(meta);
+        }
         let path_str = path.to_string_lossy();
         let result = self
             .channel
@@ -529,6 +670,9 @@ impl FileSystem for RemoteFileSystem {
     }
 
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        if let Some(canon) = self.prewarm_canon(path) {
+            return Ok(canon);
+        }
         let params = serde_json::json!({"path": path.to_string_lossy()});
         let result = self
             .channel
@@ -540,6 +684,11 @@ impl FileSystem for RemoteFileSystem {
         })?;
 
         Ok(PathBuf::from(canonical))
+    }
+
+    fn clear_prewarm(&self) {
+        let mut cache = self.prewarm.lock().unwrap();
+        *cache = PrewarmCache::default();
     }
 
     fn current_uid(&self) -> u32 {
@@ -843,8 +992,70 @@ impl FileWriter for AppendingRemoteFileWriter {
 }
 
 #[cfg(test)]
+impl RemoteFileSystem {
+    /// Seed the prewarm content cache directly, so the read-side consultation
+    /// can be unit-tested without standing up a live agent.
+    fn test_seed_prewarm_content(&self, path: PathBuf, content: Vec<u8>) {
+        self.prewarm.lock().unwrap().content.insert(path, content);
+    }
+
+    /// True when every prewarm cache is empty (used to assert `clear_prewarm`).
+    fn test_prewarm_is_empty(&self) -> bool {
+        let cache = self.prewarm.lock().unwrap();
+        cache.content.is_empty() && cache.meta.is_empty() && cache.canon.is_empty()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a `RemoteFileSystem` over a dead in-memory transport. The agent
+    /// channel's tasks start (a runtime must be current) but nothing answers —
+    /// which is exactly the point: a prewarmed read must be served from cache
+    /// without ever touching the link.
+    fn fs_over_dead_transport() -> (tokio::runtime::Runtime, RemoteFileSystem) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let fs = rt.block_on(async {
+            let (near, _far) = tokio::io::duplex(64);
+            let (reader, writer) = tokio::io::split(near);
+            let channel = std::sync::Arc::new(AgentChannel::from_transport(
+                tokio::io::BufReader::new(reader),
+                writer,
+                8,
+            ));
+            RemoteFileSystem::new(channel, "test".to_string())
+        });
+        (rt, fs)
+    }
+
+    #[test]
+    fn prewarmed_reads_are_served_from_cache() {
+        let (_rt, fs) = fs_over_dead_transport();
+        let path = PathBuf::from("/proj/notes.txt");
+        fs.test_seed_prewarm_content(path.clone(), b"REMOTE NOTES\n".to_vec());
+
+        // Full read and in-range slice come from the cache — no round-trip, so
+        // this returns instantly even though the transport is dead.
+        assert_eq!(fs.read_file(&path).unwrap(), b"REMOTE NOTES\n");
+        assert_eq!(fs.read_range(&path, 0, 6).unwrap(), b"REMOTE");
+        assert!(fs.open_file(&path).is_ok());
+
+        // A range past the cached content preserves the live path's short-read
+        // semantics rather than truncating.
+        assert_eq!(
+            fs.read_range(&path, 7, 100).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+
+        // Once cleared the cache is empty; later reads go back to the link.
+        fs.clear_prewarm();
+        assert!(fs.test_prewarm_is_empty());
+    }
 
     #[test]
     fn test_convert_metadata() {

@@ -596,6 +596,23 @@ pub trait FileSystem: Send + Sync {
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf>;
 
     // ========================================================================
+    // Materialization Prewarm
+    // ========================================================================
+
+    /// Drop any prewarmed read cache the backend is holding, so later reads go
+    /// back to the live link.
+    ///
+    /// The remote backend can be told (on its connect worker, off the editor
+    /// loop) to fetch a freshly-connected session's persisted buffers into a
+    /// short-lived cache, so materializing that session — reopening those
+    /// buffers — serves them from memory instead of freezing the single-threaded
+    /// editor loop on the slow link. That warm-up is a remote-only async method
+    /// (`RemoteFileSystem::prewarm_paths_async`); this trait hook is just the
+    /// teardown half, called once the restore has consumed the cache. Local
+    /// filesystems never populate it, so the default is a no-op.
+    fn clear_prewarm(&self) {}
+
+    // ========================================================================
     // Utility Methods
     // ========================================================================
 

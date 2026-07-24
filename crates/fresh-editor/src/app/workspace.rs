@@ -677,6 +677,37 @@ impl Editor {
         self.plugin_global_state = saved_plugin_state;
     }
 
+    /// Absolute paths of the persisted buffers a dormant session rooted at
+    /// `root` would reopen when promoted. Used to prewarm those files on the
+    /// connect worker (see `start_remote_connect_prewarming`) so a remote
+    /// session's materialization doesn't read them on the editor loop. Reads
+    /// the same on-disk workspace `promote_dormant_remote` restores from, so the
+    /// path set matches; an absent/corrupt workspace yields an empty list
+    /// (nothing to prewarm, restore behaves as before).
+    pub(crate) fn dormant_workspace_prewarm_paths(&self, root: &Path) -> Vec<PathBuf> {
+        let workspace = if let Some(name) = self.session_name.clone() {
+            crate::workspace::Workspace::load_session(&name, root)
+                .ok()
+                .flatten()
+        } else {
+            crate::workspace::Workspace::load(root).ok().flatten()
+        };
+        let Some(workspace) = workspace else {
+            return Vec::new();
+        };
+        let mut paths: Vec<PathBuf> = collect_file_paths_from_states(&workspace.split_states)
+            .into_iter()
+            .map(|rel| root.join(rel))
+            .collect();
+        // External files persist as absolute paths already.
+        for abs in &workspace.external_files {
+            if !paths.contains(abs) {
+                paths.push(abs.clone());
+            }
+        }
+        paths
+    }
+
     /// Eagerly materialize every not-yet-restored window. Production
     /// startup is lazy (per-window restore on first dive/preview via
     /// `materialize_window`); this eager variant exists only for tests

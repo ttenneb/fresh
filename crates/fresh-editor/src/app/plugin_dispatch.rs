@@ -4244,6 +4244,21 @@ impl Editor {
         reconnect_window: Option<fresh_core::WindowId>,
         request_id: u64,
     ) {
+        self.start_remote_connect_prewarming(spec, reconnect_window, request_id, Vec::new());
+    }
+
+    /// Like [`Self::start_remote_connect`] but, on success, prewarms `prewarm_paths`
+    /// (the persisted-workspace files a dive is about to reopen) on the connect
+    /// worker before signalling readiness — so materializing the session doesn't
+    /// run those slow reads on the editor loop. Empty `prewarm_paths` is exactly
+    /// the old behaviour.
+    pub(crate) fn start_remote_connect_prewarming(
+        &mut self,
+        spec: crate::services::authority::RemoteAgentSpec,
+        reconnect_window: Option<fresh_core::WindowId>,
+        request_id: u64,
+        prewarm_paths: Vec<std::path::PathBuf>,
+    ) {
         // Take owned handles up front so the immutable borrows of `self`
         // end before the mutable `set_status_message` / spawn below.
         let runtime = self.tokio_runtime.clone();
@@ -4312,6 +4327,9 @@ impl Editor {
                 let workspace = target.workspace.clone().map(std::path::PathBuf::from);
                 let mode = mode_for(&label);
                 self.set_status_message(format!("Connecting to {label}…"));
+                // Buffer prewarm is currently SSH-only (see the Ssh arm); the
+                // kube transport connects without it.
+                drop(prewarm_paths);
                 runtime.spawn(async move {
                     let outcome = crate::services::authority::connect_kube_authority(
                         target,
@@ -4368,12 +4386,16 @@ impl Editor {
                 let mode = mode_for(&label);
                 self.set_status_message(format!("Connecting to {label}…"));
                 runtime.spawn(async move {
+                    // `prewarm_paths` (a dive's persisted buffers) is warmed
+                    // inside the connect, on its own worker — never on this
+                    // editor-runtime task, whose cancellation must stay cheap.
                     let outcome = crate::services::authority::connect_ssh_authority(
                         params,
                         remote_path,
                         trust,
                         env,
                         Some(cancel_rx),
+                        prewarm_paths,
                     )
                     .await;
                     let msg = match outcome {
