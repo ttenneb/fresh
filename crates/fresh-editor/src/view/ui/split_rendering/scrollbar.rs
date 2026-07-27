@@ -4,6 +4,7 @@
 //! parameters. They have no dependency on any shared render-time "mega
 //! struct".
 
+use crate::primitives::visual_layout::visual_width_with_tab_size;
 use crate::state::EditorState;
 use crate::view::theme::Theme;
 use crate::view::viewport::Viewport;
@@ -135,15 +136,53 @@ pub(super) fn scrollbar_visual_row_counts(
     (total_visual_rows, top_visual_row)
 }
 
-/// Compute the maximum line length encountered so far (in display columns).
-/// Only scans the currently visible lines (plus a small margin) and updates
-/// the running maximum stored in the viewport.
-pub(super) fn compute_max_line_length(state: &mut EditorState, viewport: &mut Viewport) -> usize {
-    let buffer_len = state.buffer.len();
-    let visible_width = viewport.width as usize;
+/// Shared no-wrap horizontal geometry for painting, scrollbar rendering, and
+/// cached mouse bounds. `content_width` includes the one-column EOL caret.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HorizontalScrollMetrics {
+    pub content_width: usize,
+    pub visible_text_width: usize,
+    pub max_scroll: usize,
+}
 
-    if buffer_len == 0 {
-        return viewport.max_line_length_seen.max(visible_width);
+impl HorizontalScrollMetrics {
+    pub fn new(max_visual_line_width: usize, visible_text_width: usize) -> Self {
+        let content_width = max_visual_line_width.saturating_add(1);
+        Self {
+            content_width,
+            visible_text_width,
+            max_scroll: content_width.saturating_sub(visible_text_width),
+        }
+    }
+
+    /// Combine the persistent source-derived maximum with this frame's
+    /// canonical post-transform width. Canonical/inlay expansion deliberately
+    /// remains frame-local so removing it immediately restores source bounds.
+    pub fn for_frame(
+        source_max_visual_width: usize,
+        canonical_max_visual_width: usize,
+        visible_text_width: usize,
+    ) -> Self {
+        Self::new(
+            source_max_visual_width.max(canonical_max_visual_width),
+            visible_text_width,
+        )
+    }
+}
+
+/// Update and return the viewport's source-derived maximum in display columns.
+///
+/// Only scans the currently visible lines plus a small margin. The maximum is
+/// deliberately monotonic between the existing viewport reset/invalidation
+/// points: a wide source line remains scrollable after it leaves the frame.
+/// Post-transform `ViewLine` widths are intentionally not stored here.
+pub(super) fn compute_max_line_length(
+    state: &mut EditorState,
+    viewport: &mut Viewport,
+    tab_size: usize,
+) -> usize {
+    if state.buffer.is_empty() {
+        return viewport.max_line_length_seen;
     }
 
     let visible_lines = viewport.height as usize + 5;
@@ -155,17 +194,20 @@ pub(super) fn compute_max_line_length(state: &mut EditorState, viewport: &mut Vi
         }
         match iter.next_line() {
             Some((_byte_offset, content)) => {
-                let display_len = content.len();
-                if display_len > viewport.max_line_length_seen {
-                    viewport.max_line_length_seen = display_len;
-                }
+                // LineIterator includes the physical terminator. Exclude LF and
+                // its optional CR partner explicitly before adding the shared
+                // logical EOL-caret cell in HorizontalScrollMetrics.
+                let text = content.strip_suffix('\n').unwrap_or(&content);
+                let text = text.strip_suffix('\r').unwrap_or(text);
+                let display_len = visual_width_with_tab_size(text, 0, tab_size);
+                viewport.max_line_length_seen = viewport.max_line_length_seen.max(display_len);
                 lines_scanned += 1;
             }
             None => break,
         }
     }
 
-    viewport.max_line_length_seen.max(visible_width)
+    viewport.max_line_length_seen
 }
 
 /// Render a scrollbar for a split.
@@ -247,8 +289,6 @@ pub(super) fn render_scrollbar(
 }
 
 /// Render a horizontal scrollbar for a split.
-/// `max_content_width` should be the actual max line length
-/// (from [`compute_max_line_length`]).
 /// Returns (thumb_start_col, thumb_end_col) for mouse hit testing.
 pub(super) fn render_horizontal_scrollbar(
     buf: &mut ratatui::buffer::Buffer,
@@ -256,7 +296,7 @@ pub(super) fn render_horizontal_scrollbar(
     hscrollbar_rect: Rect,
     _is_active: bool,
     theme: &Theme,
-    max_content_width: usize,
+    metrics: HorizontalScrollMetrics,
 ) -> (usize, usize) {
     let width = hscrollbar_rect.width as usize;
     if width == 0 || hscrollbar_rect.height == 0 {
@@ -274,16 +314,15 @@ pub(super) fn render_horizontal_scrollbar(
         return (0, width);
     }
 
-    let visible_width = viewport.width as usize;
     let left_column = viewport.left_column;
-
-    let max_scroll = max_content_width.saturating_sub(visible_width);
+    let max_scroll = metrics.max_scroll;
 
     let (thumb_start, thumb_size) = if max_scroll == 0 {
         (0, width)
     } else {
-        let thumb_size_raw =
-            ((visible_width as f64 / max_content_width as f64) * width as f64).ceil() as usize;
+        let thumb_size_raw = ((metrics.visible_text_width as f64 / metrics.content_width as f64)
+            * width as f64)
+            .ceil() as usize;
         let thumb_size = thumb_size_raw.max(2).min(width);
 
         let scroll_ratio = left_column.min(max_scroll) as f64 / max_scroll as f64;
@@ -400,6 +439,33 @@ mod tests {
         let mut vp = Viewport::new(40, 24);
         vp.line_wrap_enabled = true;
         vp
+    }
+
+    #[test]
+    fn local_source_width_matches_renderer_tab_size_and_excludes_terminators() {
+        // `界` is two cells and the ANSI sequence is zero cells. Both LF and
+        // CRLF are physical terminators, not additional horizontal content.
+        for (tab_size, expected_text_width) in [(2, 5), (4, 7), (8, 11)] {
+            let mut state = state_with_wrapping_lines(0);
+            state.buffer.insert(0, "a\t界\x1b[31mx\na\t界\x1b[31mx\r\n");
+            let mut viewport = Viewport::new(80, 1);
+            let source_max = compute_max_line_length(&mut state, &mut viewport, tab_size);
+            assert_eq!(source_max, expected_text_width, "tab_size={tab_size}");
+            assert_eq!(
+                HorizontalScrollMetrics::new(source_max, 0).content_width,
+                expected_text_width + 1,
+                "exactly one EOL caret cell for tab_size={tab_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn horizontal_metrics_share_effective_text_width_for_compose_and_gutter() {
+        // A 30-cell compose render area with a 4-cell gutter has the same
+        // 26-cell text window used by paint, thumb geometry, and mouse bounds.
+        let metrics = HorizontalScrollMetrics::new(40, 30usize.saturating_sub(4));
+        assert_eq!(metrics.visible_text_width, 26);
+        assert_eq!(metrics.max_scroll, 15);
     }
 
     /// Small wrapped buffers keep the exact visual-row scrollbar: total counts

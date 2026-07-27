@@ -1,5 +1,6 @@
 use crate::common::fixtures::TestFixture;
 use crate::common::harness::EditorTestHarness;
+use crossterm::event::{KeyCode, KeyModifiers};
 use tempfile::TempDir;
 
 /// Test viewport scrolling with large file
@@ -226,6 +227,112 @@ fn test_horizontal_scrolling() {
 
     // Verify buffer position is correct
     assert_eq!(harness.cursor_position(), 90);
+}
+
+/// The no-wrap right bound reserves the vertical scrollbar, including for
+/// tab-expanded, combining, and wide emoji cells.
+#[test]
+fn test_horizontal_scroll_right_bound_preserves_vertical_scrollbar() {
+    use fresh::config::Config;
+
+    let mut config = Config::default();
+    config.editor.line_wrap = false;
+    config.editor.show_horizontal_scrollbar = true;
+    config.editor.show_vertical_scrollbar = true;
+    let mut harness = EditorTestHarness::with_config(40, 12, config).unwrap();
+    let long_line = format!("{}Z", "\t界e\u{301}🦀".repeat(16));
+    let content = format!("{}{}", "short\n".repeat(16), long_line);
+    let _fixture = harness.load_buffer_from_text(&content).unwrap();
+
+    harness
+        .send_key(KeyCode::End, KeyModifiers::CONTROL)
+        .unwrap();
+    let cursor = harness.render_observing_cursor().unwrap().unwrap();
+    let scrollbar_x = harness.buffer().area.width - 1;
+    let (content_first_row, _) = harness.content_area_rows();
+    let content_last_row = content_first_row + harness.viewport_height() - 1;
+
+    assert_eq!(
+        cursor.0,
+        scrollbar_x - 1,
+        "the EOL caret must be immediately left of the scrollbar"
+    );
+    assert_eq!(
+        harness.get_cell(cursor.0 - 1, cursor.1).as_deref(),
+        Some("Z"),
+        "the final source cell must remain reachable before the EOL caret"
+    );
+    for row in content_first_row as u16..=content_last_row as u16 {
+        assert_eq!(harness.get_cell(scrollbar_x, row).as_deref(), Some(" "));
+        assert!(
+            harness.is_scrollbar_thumb_at(scrollbar_x, row)
+                || harness.is_scrollbar_track_at(scrollbar_x, row),
+            "vertical scrollbar style missing at ({scrollbar_x}, {row})"
+        );
+    }
+}
+
+/// A source extent encountered in an earlier frame remains the horizontal
+/// bound after vertical scrolling leaves only narrow source lines to render.
+#[test]
+fn test_horizontal_scroll_extent_survives_wide_line_leaving_viewport() {
+    use fresh::config::Config;
+
+    let mut config = Config::default();
+    config.editor.line_wrap = false;
+    config.editor.show_horizontal_scrollbar = true;
+    config.editor.show_vertical_scrollbar = true;
+    let mut harness = EditorTestHarness::with_config(40, 12, config).unwrap();
+
+    let wide_line = "W".repeat(160);
+    let narrow_lines = (0..40)
+        // Keep a marker in the horizontally panned portion while remaining
+        // narrower than the encountered source extent.
+        .map(|line| format!("{}narrow-{line}", "n".repeat(130)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _fixture = harness
+        .load_buffer_from_text(&format!("{wide_line}\n{narrow_lines}"))
+        .unwrap();
+
+    // Pan to the wide line's right edge, then render it so its source extent
+    // enters the cached scrollbar metrics.
+    harness.send_key(KeyCode::End, KeyModifiers::NONE).unwrap();
+    harness.render().unwrap();
+    let wide_left_column = harness.editor().active_viewport().left_column;
+    assert!(
+        wide_left_column > 0,
+        "wide source line should pan the viewport right"
+    );
+    assert_eq!(
+        harness.editor().active_viewport().max_line_length_seen,
+        wide_line.len(),
+        "rendering the wide source line should cache its display width"
+    );
+
+    // Mouse scrolling changes the viewport without moving the cursor back to
+    // column zero. After this, every rendered source line is narrow.
+    let (content_row, _) = harness.content_area_rows();
+    for _ in 0..5 {
+        harness.mouse_scroll_down(5, content_row as u16).unwrap();
+    }
+    harness.render().unwrap();
+    assert!(
+        harness.top_line_number() > 0,
+        "the wide first line must be outside the rendered viewport"
+    );
+    harness.assert_screen_contains("narrow-");
+
+    let viewport = harness.editor().active_viewport();
+    assert_eq!(
+        viewport.max_line_length_seen,
+        wide_line.len(),
+        "narrow rendered lines must not replace cached scrollbar extent"
+    );
+    assert_eq!(
+        viewport.left_column, wide_left_column,
+        "the actual horizontal bound must not snap left after the wide line leaves the viewport"
+    );
 }
 
 /// Test horizontal scrolling when moving cursor left

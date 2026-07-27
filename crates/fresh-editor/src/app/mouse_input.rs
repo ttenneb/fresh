@@ -2324,19 +2324,12 @@ impl Editor {
         col: u16,
         row: u16,
     ) -> Option<AnyhowResult<()>> {
-        let (split_id, buffer_id, hscrollbar_rect, max_content_width, is_on_thumb) = self
+        let (split_id, buffer_id, hscrollbar_rect, max_scroll, is_on_thumb) = self
             .active_layout()
             .horizontal_scrollbar_areas
             .iter()
             .find_map(
-                |(
-                    split_id,
-                    buffer_id,
-                    hscrollbar_rect,
-                    max_content_width,
-                    thumb_start,
-                    thumb_end,
-                )| {
+                |(split_id, buffer_id, hscrollbar_rect, max_scroll, thumb_start, thumb_end)| {
                     if col >= hscrollbar_rect.x
                         && col < hscrollbar_rect.x + hscrollbar_rect.width
                         && row >= hscrollbar_rect.y
@@ -2348,7 +2341,7 @@ impl Editor {
                             *split_id,
                             *buffer_id,
                             *hscrollbar_rect,
-                            *max_content_width,
+                            *max_scroll,
                             on_thumb,
                         ))
                     } else {
@@ -2391,8 +2384,6 @@ impl Editor {
                 .expect("active window must have a populated split layout")
                 .get_mut(&split_id)
             {
-                let visible_width = vs.viewport.width as usize;
-                let max_scroll = max_content_width.saturating_sub(visible_width);
                 let target_col = (ratio * max_scroll as f64).round() as usize;
                 vs.viewport.left_column = target_col.min(max_scroll);
                 vs.viewport.set_skip_ensure_visible();
@@ -2824,14 +2815,8 @@ impl Editor {
             // `self.split_view_states`. The active window's layout cache
             // is repopulated each frame, so a one-frame snapshot is fine.
             let hscrollbar_areas = self.active_layout().horizontal_scrollbar_areas.clone();
-            for (
-                split_id,
-                _buffer_id,
-                hscrollbar_rect,
-                max_content_width,
-                thumb_start,
-                thumb_end,
-            ) in &hscrollbar_areas
+            for (split_id, _buffer_id, hscrollbar_rect, max_scroll, thumb_start, thumb_end) in
+                &hscrollbar_areas
             {
                 if *split_id == dragging_split_id {
                     let track_width = hscrollbar_rect.width as f64;
@@ -2853,17 +2838,15 @@ impl Editor {
                             .expect("active window must have a populated split layout")
                             .get_mut(&dragging_split_id)
                         {
-                            let visible_width = view_state.viewport.width as usize;
-                            let max_scroll = max_content_width.saturating_sub(visible_width);
-                            if max_scroll > 0 {
+                            if *max_scroll > 0 {
                                 let thumb_size = thumb_end.saturating_sub(*thumb_start).max(1);
                                 let track_travel = (track_width - thumb_size as f64).max(1.0);
-                                let scroll_per_pixel = max_scroll as f64 / track_travel;
+                                let scroll_per_pixel = *max_scroll as f64 / track_travel;
                                 let scroll_offset =
                                     (col_offset as f64 * scroll_per_pixel).round() as i64;
                                 let new_left =
                                     (drag_start_left_column as i64 + scroll_offset).max(0) as usize;
-                                view_state.viewport.left_column = new_left.min(max_scroll);
+                                view_state.viewport.left_column = new_left.min(*max_scroll);
                                 view_state.viewport.set_skip_ensure_visible();
                             }
                         }
@@ -2879,10 +2862,8 @@ impl Editor {
                             .expect("active window must have a populated split layout")
                             .get_mut(&dragging_split_id)
                         {
-                            let visible_width = view_state.viewport.width as usize;
-                            let max_scroll = max_content_width.saturating_sub(visible_width);
-                            let target_col = (ratio * max_scroll as f64).round() as usize;
-                            view_state.viewport.left_column = target_col.min(max_scroll);
+                            let target_col = (ratio * *max_scroll as f64).round() as usize;
+                            view_state.viewport.left_column = target_col.min(*max_scroll);
                             view_state.viewport.set_skip_ensure_visible();
                         }
                     }

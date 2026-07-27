@@ -14,6 +14,7 @@ use super::super::layout::{
 use super::super::post_pass::{
     apply_background_to_lines, render_column_guides, render_cursor_column_bg, render_ruler_bg,
 };
+use super::super::scrollbar::{compute_max_line_length, HorizontalScrollMetrics};
 use super::super::view_data::build_view_data;
 use super::contexts::SelectionContext;
 use super::overlays::{decoration_context, selection_context};
@@ -26,6 +27,7 @@ use crate::primitives::ansi_background::AnsiBackground;
 use crate::state::{EditorState, ViewMode};
 use crate::view::folding::FoldManager;
 use crate::view::theme::Theme;
+use crate::view::ui::view_pipeline::ViewLine;
 use crate::view::viewport::Viewport;
 use fresh_core::api::ViewTransformPayload;
 use ratatui::layout::Rect;
@@ -45,6 +47,7 @@ pub(crate) struct BufferLayoutOutput {
     pub view_mode: ViewMode,
     pub left_column: usize,
     pub gutter_width: usize,
+    pub horizontal_scroll: HorizontalScrollMetrics,
     pub buffer_ends_with_newline: bool,
     pub selection: SelectionContext,
 }
@@ -85,6 +88,13 @@ pub(crate) fn resolve_cursor_fallback(
     last_line_end.map(|end| end.pos)
 }
 
+/// Return a canonical ViewLine's rendered text width without its explicit
+/// one-cell newline sentinel. Horizontal metrics add the EOL caret separately.
+fn canonical_view_line_text_width(line: &ViewLine) -> usize {
+    line.visual_width()
+        .saturating_sub(usize::from(line.ends_with_newline))
+}
+
 /// Pure layout computation for a buffer in a split pane.
 /// No frame/drawing involved — produces a `BufferLayoutOutput` that the
 /// drawing phase can consume.
@@ -107,6 +117,7 @@ pub(crate) fn compute_buffer_layout(
     use_terminal_bg: bool,
     session_mode: bool,
     software_cursor_only: bool,
+    show_horizontal_scrollbar: bool,
     show_line_numbers: bool,
     highlight_current_line: bool,
     diagnostics_inline_text: bool,
@@ -179,6 +190,20 @@ pub(crate) fn compute_buffer_layout(
         }
     }
     let render_area = compose_layout.render_area;
+
+    // Establish the raw, viewport-local width estimate now that the canonical
+    // text rectangle is known, but do not clamp yet: post-transform ViewLines
+    // may expand the valid range with inline virtual text. Hidden-scrollbar
+    // behavior remains unchanged by keeping all horizontal bounds behind this
+    // gate.
+    let visible_text_width = (render_area.width as usize).saturating_sub(gutter_width);
+    let source_max_visual_width = if show_horizontal_scrollbar && !line_wrap {
+        compute_max_line_length(state, viewport, state.buffer_settings.tab_size)
+    } else {
+        0
+    };
+    let mut horizontal_scroll =
+        HorizontalScrollMetrics::new(source_max_visual_width, visible_text_width);
 
     // Clone view_transform so we can reuse it if scrolling triggers a rebuild
     let view_transform_for_rebuild = view_transform.clone();
@@ -284,6 +309,27 @@ pub(crate) fn compute_buffer_layout(
     } else {
         view_data
     };
+
+    // ViewLine is the canonical post-transform representation, so fold in its
+    // visual widths (including inlays/conceal effects) without scanning beyond
+    // the already-built viewport. ViewLine stores its explicit newline token as
+    // one visual sentinel; remove that before HorizontalScrollMetrics adds the
+    // single EOL-caret cell. This is the sole clamp, after canonical widths are
+    // known but before render_view_lines consumes left_column.
+    if show_horizontal_scrollbar && !line_wrap {
+        let canonical_max = view_data
+            .lines
+            .iter()
+            .map(canonical_view_line_text_width)
+            .max()
+            .unwrap_or(0);
+        horizontal_scroll = HorizontalScrollMetrics::for_frame(
+            source_max_visual_width,
+            canonical_max,
+            visible_text_width,
+        );
+        viewport.left_column = viewport.left_column.min(horizontal_scroll.max_scroll);
+    }
 
     let view_anchor = calculate_view_anchor(&view_data.lines, viewport.top_byte);
 
@@ -418,6 +464,7 @@ pub(crate) fn compute_buffer_layout(
         view_mode,
         left_column: viewport.left_column,
         gutter_width,
+        horizontal_scroll,
         buffer_ends_with_newline,
         selection,
     }
@@ -611,7 +658,7 @@ pub(crate) fn draw_buffer_in_split(
 
 /// Render a single buffer in a split pane (convenience wrapper).
 /// Calls [`compute_buffer_layout`] then [`draw_buffer_in_split`].
-/// Returns the view line mappings for mouse click handling.
+/// Returns view-line mappings plus the horizontal geometry used for this frame.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_buffer_in_split(
     buf: &mut ratatui::buffer::Buffer,
@@ -639,7 +686,7 @@ pub(crate) fn render_buffer_in_split(
     cell_theme_map: &mut Vec<CellThemeInfo>,
     screen_width: u16,
     pending_hardware_cursor: &mut Option<(u16, u16)>,
-) -> Vec<ViewLineMapping> {
+) -> (Vec<ViewLineMapping>, HorizontalScrollMetrics) {
     // The style group provides theme + the appearance flags; unpack into the
     // locals the body already uses by name. The cfg fields this painter
     // doesn't read are ignored.
@@ -655,6 +702,7 @@ pub(crate) fn render_buffer_in_split(
         relative_line_numbers,
         use_terminal_bg,
         software_cursor_only,
+        show_horizontal_scrollbar,
         diagnostics_inline_text,
         indentation_guide,
         indentation_guide_glyph,
@@ -679,6 +727,7 @@ pub(crate) fn render_buffer_in_split(
         use_terminal_bg,
         session_mode,
         software_cursor_only,
+        show_horizontal_scrollbar,
         show_line_numbers,
         highlight_current_line,
         diagnostics_inline_text,
@@ -690,6 +739,7 @@ pub(crate) fn render_buffer_in_split(
     );
 
     let view_line_mappings = layout_output.view_line_mappings.clone();
+    let horizontal_scroll = layout_output.horizontal_scroll;
 
     draw_buffer_in_split(
         buf,
@@ -710,5 +760,5 @@ pub(crate) fn render_buffer_in_split(
         pending_hardware_cursor,
     );
 
-    view_line_mappings
+    (view_line_mappings, horizontal_scroll)
 }

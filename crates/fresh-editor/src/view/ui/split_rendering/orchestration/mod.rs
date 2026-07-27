@@ -25,8 +25,8 @@ use super::layout::{
     sync_viewport_to_content, SplitLayout,
 };
 use super::scrollbar::{
-    compute_max_line_length, render_composite_scrollbar, render_horizontal_scrollbar,
-    render_scrollbar, scrollbar_line_counts,
+    render_composite_scrollbar, render_horizontal_scrollbar, render_scrollbar,
+    scrollbar_line_counts,
 };
 use super::EditorRenderConfig;
 use crate::app::types::ViewLineMapping;
@@ -121,7 +121,7 @@ pub(crate) fn render_content(
     Vec<(LeafId, u16, u16, u16)>,                      // close split button areas
     Vec<(LeafId, u16, u16, u16)>,                      // maximize split button areas
     HashMap<LeafId, Vec<ViewLineMapping>>,             // view line mappings for mouse clicks
-    Vec<(LeafId, BufferId, Rect, usize, usize, usize)>, // horizontal scrollbar areas (rect + max_content_width + thumb_start + thumb_end)
+    Vec<(LeafId, BufferId, Rect, usize, usize, usize)>, // horizontal scrollbar areas (rect + max_scroll + thumb_start + thumb_end)
     Vec<(
         crate::model::event::ContainerId,
         SplitDirection,
@@ -476,7 +476,7 @@ pub(crate) fn render_content(
                 .unwrap_or(&mut empty_folds);
 
             let _render_buf_span = tracing::trace_span!("render_buffer_in_split").entered();
-            let split_view_mappings = render_buffer_in_split(
+            let (split_view_mappings, horizontal_scroll) = render_buffer_in_split(
                 buf,
                 state,
                 &split_cursors,
@@ -534,20 +534,6 @@ pub(crate) fn render_content(
                 (0, 0)
             };
 
-            // Compute the actual max line length for horizontal scrollbar
-            let max_content_width = if show_horizontal_scrollbar && !viewport.line_wrap_enabled {
-                let mcw = compute_max_line_length(state, &mut viewport);
-                // Clamp left_column so content can't scroll past the end of the longest line
-                let visible_width = viewport.width as usize;
-                let max_scroll = mcw.saturating_sub(visible_width);
-                if viewport.left_column > max_scroll {
-                    viewport.left_column = max_scroll;
-                }
-                mcw
-            } else {
-                0
-            };
-
             // Render horizontal scrollbar for this split
             let (hthumb_start, hthumb_end) = if show_horizontal_scrollbar {
                 render_horizontal_scrollbar(
@@ -556,7 +542,7 @@ pub(crate) fn render_content(
                     layout.horizontal_scrollbar_rect,
                     is_active,
                     theme,
-                    max_content_width,
+                    horizontal_scroll,
                 )
             } else {
                 (0, 0)
@@ -592,7 +578,7 @@ pub(crate) fn render_content(
                     split_id,
                     buffer_id,
                     layout.horizontal_scrollbar_rect,
-                    max_content_width,
+                    horizontal_scroll.max_scroll,
                     hthumb_start,
                     hthumb_end,
                 ));
@@ -1220,6 +1206,7 @@ pub(crate) fn compute_content_layout(
             use_terminal_bg,
             session_mode,
             software_cursor_only,
+            show_horizontal_scrollbar,
             view_prefs.show_line_numbers,
             effective_highlight_current_line,
             diagnostics_inline_text,

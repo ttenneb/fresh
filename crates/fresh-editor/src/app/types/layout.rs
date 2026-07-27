@@ -233,7 +233,7 @@ pub(crate) struct WindowLayoutCache {
     /// (split_id, buffer_id, content_rect, scrollbar_rect, thumb_start, thumb_end)
     pub split_areas: Vec<(LeafId, BufferId, Rect, Rect, usize, usize)>,
     /// Horizontal scrollbar areas per split
-    /// (split_id, buffer_id, horizontal_scrollbar_rect, max_content_width, thumb_start_col, thumb_end_col)
+    /// (split_id, buffer_id, horizontal_scrollbar_rect, max_scroll, thumb_start_col, thumb_end_col)
     pub horizontal_scrollbar_areas: Vec<(LeafId, BufferId, Rect, usize, usize, usize)>,
     /// Split separator positions for drag resize
     /// (container_id, direction, x, y, length)
