@@ -1568,10 +1568,10 @@ impl Viewport {
             return;
         }
 
-        let scrollbar_width = 1;
-        let visible_width = (self.width as usize)
-            .saturating_sub(gutter_width)
-            .saturating_sub(scrollbar_width);
+        // `width` is the split content rectangle. Its shared layout boundary
+        // has already reserved the vertical-scrollbar column, so subtracting
+        // one more cell here would leave the rightmost text cell unreachable.
+        let visible_width = (self.width as usize).saturating_sub(gutter_width);
 
         if visible_width == 0 {
             return;
@@ -2380,13 +2380,11 @@ impl Viewport {
         line_length: usize,
         buffer: &mut Buffer,
     ) {
-        // Calculate visible width (accounting for line numbers gutter which is dynamic)
+        // Calculate visible width (accounting for line numbers gutter which is dynamic).
+        // `width` is the split content rectangle and already excludes any
+        // vertical scrollbar allocated by the shared split layout.
         let gutter_width = self.gutter_width(buffer);
-        // Also account for scrollbar (always present, takes 1 column)
-        let scrollbar_width = 1;
-        let visible_width = (self.width as usize)
-            .saturating_sub(gutter_width)
-            .saturating_sub(scrollbar_width);
+        let visible_width = (self.width as usize).saturating_sub(gutter_width);
 
         if visible_width == 0 {
             return; // Terminal too narrow

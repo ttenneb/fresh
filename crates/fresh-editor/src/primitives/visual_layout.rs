@@ -178,25 +178,34 @@ impl LineMappingsBuilder {
     }
 }
 
-/// Calculate visual width of a string, handling ANSI escapes and tabs
+/// Calculate visual width of a string, handling ANSI escapes and tabs.
 ///
-/// This is the canonical function for visual width calculation.
-/// Use this instead of `str_width()` when the text may contain ANSI codes or tabs.
+/// This uses the terminal-default eight-column tab stops. Call
+/// [`visual_width_with_tab_size`] when matching a configured editor renderer.
 pub fn visual_width(s: &str, start_col: usize) -> usize {
+    visual_width_with_tab_size(s, start_col, TAB_WIDTH)
+}
+
+/// Calculate visual width using the renderer's configured tab size.
+///
+/// `start_col` participates in tab-stop calculation; ANSI escapes remain
+/// zero-width and Unicode uses the same cell widths as the renderer. A zero
+/// tab size is normalized like `ViewLineIterator`.
+pub fn visual_width_with_tab_size(s: &str, start_col: usize, tab_size: usize) -> usize {
     if !s.contains('\x1b') && !s.contains('\t') {
-        // Fast path: no special handling needed
         return crate::primitives::display_width::str_width(s);
     }
 
+    let tab_size = if tab_size == 0 { 4 } else { tab_size };
     let mut col = start_col;
     let mut parser = AnsiParser::new();
 
     for ch in s.chars() {
         if parser.parse_char(ch).is_none() {
-            continue; // ANSI escape char, skip
+            continue;
         }
         if ch == '\t' {
-            col += tab_expansion_width(col);
+            col += tab_size - (col % tab_size);
         } else {
             col += char_width(ch);
         }

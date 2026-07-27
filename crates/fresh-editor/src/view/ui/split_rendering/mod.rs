@@ -314,6 +314,7 @@ impl SplitRenderer {
             screen_width,
             &mut sink,
         )
+        .0
     }
 
     /// Public wrapper for building base tokens - used by render.rs for the

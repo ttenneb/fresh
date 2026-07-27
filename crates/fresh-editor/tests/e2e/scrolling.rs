@@ -1,5 +1,6 @@
 use crate::common::fixtures::TestFixture;
 use crate::common::harness::EditorTestHarness;
+use crossterm::event::{KeyCode, KeyModifiers};
 use tempfile::TempDir;
 
 /// Test viewport scrolling with large file
@@ -226,6 +227,206 @@ fn test_horizontal_scrolling() {
 
     // Verify buffer position is correct
     assert_eq!(harness.cursor_position(), 90);
+}
+
+/// The no-wrap right bound reaches the final glyph and EOL caret with both
+/// scrollbar layouts, while retaining every cell of a shown vertical bar.
+#[test]
+fn test_horizontal_scroll_right_bound_reaches_eol_with_shown_or_hidden_vertical_bar() {
+    use fresh::config::Config;
+
+    for show_vertical_scrollbar in [true, false] {
+        let mut config = Config::default();
+        config.editor.line_wrap = false;
+        config.editor.show_horizontal_scrollbar = true;
+        config.editor.show_vertical_scrollbar = show_vertical_scrollbar;
+        let mut harness = EditorTestHarness::with_config(40, 12, config).unwrap();
+        let long_line = format!("{}Z", "\t界e\u{301}🦀".repeat(16));
+        let content = format!("{}{}", "short\n".repeat(16), long_line);
+        let _fixture = harness.load_buffer_from_text(&content).unwrap();
+
+        harness
+            .send_key(KeyCode::End, KeyModifiers::CONTROL)
+            .unwrap();
+        let cursor = harness.render_observing_cursor().unwrap().unwrap();
+        let right_edge = harness.buffer().area.width - 1;
+        let expected_eol_x = right_edge - u16::from(show_vertical_scrollbar);
+
+        assert_eq!(
+            cursor.0, expected_eol_x,
+            "EOL caret must reach the final text cell (vertical bar shown: {show_vertical_scrollbar})"
+        );
+        assert_eq!(
+            harness.get_cell(cursor.0 - 1, cursor.1).as_deref(),
+            Some("Z"),
+            "the final source cell must remain reachable before the EOL caret"
+        );
+        if show_vertical_scrollbar {
+            let (content_first_row, _) = harness.content_area_rows();
+            let content_last_row = content_first_row + harness.viewport_height() - 1;
+            for row in content_first_row as u16..=content_last_row as u16 {
+                assert_eq!(harness.get_cell(right_edge, row).as_deref(), Some(" "));
+                assert!(
+                    harness.is_scrollbar_thumb_at(right_edge, row)
+                        || harness.is_scrollbar_track_at(right_edge, row),
+                    "vertical scrollbar style missing at ({right_edge}, {row})"
+                );
+            }
+        }
+    }
+}
+
+/// A source extent encountered in an earlier frame remains the horizontal
+/// bound after vertical scrolling leaves only narrow source lines to render.
+#[test]
+fn test_horizontal_scroll_extent_survives_wide_line_leaving_viewport() {
+    use fresh::config::Config;
+
+    let mut config = Config::default();
+    config.editor.line_wrap = false;
+    config.editor.show_horizontal_scrollbar = true;
+    config.editor.show_vertical_scrollbar = true;
+    // Tab size 3 is deliberately non-default; `界` is two cells, the ANSI
+    // sequence is zero cells, and CRLF is not horizontal source content.
+    const TAB_SIZE: usize = 3;
+    config.editor.tab_size = TAB_SIZE;
+    let mut harness = EditorTestHarness::with_config(40, 12, config).unwrap();
+    let wide_unit = "a\t界\x1b[31mxe\u{301}";
+    let wide_line = wide_unit.repeat(32);
+    let expected_visual_width =
+        fresh::primitives::visual_layout::visual_width_with_tab_size(&wide_line, 0, TAB_SIZE);
+    let narrow_lines = (0..40)
+        // Keep a marker in the horizontally panned portion while remaining
+        // narrower than the encountered source extent.
+        .map(|line| format!("{}narrow-{line}", "n".repeat(expected_visual_width - 20)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _fixture = harness
+        .load_buffer_from_text(&format!("{wide_line}\r\n{narrow_lines}"))
+        .unwrap();
+
+    // Pan to the wide line's right edge, then render it so its source extent
+    // enters the cached scrollbar metrics.
+    harness.send_key(KeyCode::End, KeyModifiers::NONE).unwrap();
+    // The first render observes source width; the stable frame applies the
+    // resulting shared horizontal bound before we leave this line.
+    harness.render().unwrap();
+    harness.render().unwrap();
+    assert_eq!(
+        harness.editor().active_viewport().max_line_length_seen,
+        expected_visual_width,
+        "rendering the wide source line should cache visual cells, not bytes"
+    );
+    // Establish the rendered scrollbar's actual right endpoint, rather than
+    // the cursor-visibility overscan used while Ctrl+End is processed.
+    harness
+        .send_key(KeyCode::Home, KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    let hscroll_row = harness.content_area_rows().0 as u16 + harness.viewport_height() as u16;
+    harness
+        .mouse_click(harness.buffer().area.width - 2, hscroll_row)
+        .unwrap();
+    harness.render().unwrap();
+    let wide_left_column = harness.editor().active_viewport().left_column;
+    assert!(
+        wide_left_column > 0,
+        "wide source line should pan the viewport right"
+    );
+
+    // Mouse scrolling changes the viewport without moving the cursor back to
+    // column zero. After this, every rendered source line is narrow.
+    let (content_row, _) = harness.content_area_rows();
+    for _ in 0..5 {
+        harness.mouse_scroll_down(5, content_row as u16).unwrap();
+    }
+    harness.render().unwrap();
+    assert!(
+        harness.top_line_number() > 0,
+        "the wide first line must be outside the rendered viewport"
+    );
+    harness.assert_screen_contains("narrow-");
+
+    let viewport = harness.editor().active_viewport();
+    assert_eq!(
+        viewport.max_line_length_seen, expected_visual_width,
+        "narrow rendered lines must not replace cached scrollbar extent"
+    );
+    assert!(
+        viewport.left_column >= expected_visual_width - 40,
+        "the right endpoint after the transient canonical frame leaves must still cover the cached wide source extent (was {wide_left_column}, now {})",
+        viewport.left_column
+    );
+}
+
+/// Track clicks and thumb drags must independently reach the frame's exact
+/// visual-cell max_scroll. Raw bytes would count ANSI and CRLF, while visual
+/// width must honor the configured tab stop, wide Unicode, and combining text.
+#[test]
+fn test_horizontal_scrollbar_track_click_and_thumb_drag_reach_visual_max_scroll() {
+    use fresh::config::Config;
+
+    const TAB_SIZE: usize = 3;
+    let mut config = Config::default();
+    config.editor.line_wrap = false;
+    config.editor.line_numbers = false;
+    config.editor.show_horizontal_scrollbar = true;
+    config.editor.show_vertical_scrollbar = true;
+    config.editor.tab_size = TAB_SIZE;
+    let mut harness = EditorTestHarness::with_config(40, 12, config).unwrap();
+    let long_line = "a\t界\x1b[31mxe\u{301}".repeat(40);
+    let expected_visual_width =
+        fresh::primitives::visual_layout::visual_width_with_tab_size(&long_line, 0, TAB_SIZE);
+    // With line numbers hidden, the only non-text column is the shown vertical
+    // scrollbar. Horizontal metrics add exactly one EOL-caret cell.
+    let visible_text_width = harness.buffer().area.width as usize - 1;
+    let expected_max_scroll = expected_visual_width
+        .saturating_add(1)
+        .saturating_sub(visible_text_width);
+    let _fixture = harness
+        .load_buffer_from_text(&(long_line + "\r\n"))
+        .unwrap();
+    harness.render().unwrap();
+
+    let hscroll_row = harness.content_area_rows().0 as u16 + harness.viewport_height() as u16;
+    let right_track_col = harness.buffer().area.width - 2; // left of shown vertical bar
+
+    // Far-end clicks must use the visual-cell endpoint, and remain there when
+    // repeated rather than merely agreeing with a stale cached geometry.
+    for _ in 0..2 {
+        harness.mouse_click(right_track_col, hscroll_row).unwrap();
+        harness.render().unwrap();
+        assert_eq!(
+            harness.editor().active_viewport().left_column,
+            expected_max_scroll,
+            "far-end track click must reach visual max_scroll {expected_max_scroll}"
+        );
+    }
+
+    // Return the thumb to the left, then independently drag it to the end.
+    harness
+        .send_key(KeyCode::Home, KeyModifiers::CONTROL)
+        .unwrap();
+    harness.render().unwrap();
+    assert_eq!(harness.editor().active_viewport().left_column, 0);
+    harness
+        .mouse_drag(0, hscroll_row, right_track_col, hscroll_row)
+        .unwrap();
+    harness.render().unwrap();
+    assert_eq!(
+        harness.editor().active_viewport().left_column,
+        expected_max_scroll,
+        "far-end thumb drag must reach visual max_scroll {expected_max_scroll}"
+    );
+    harness
+        .mouse_drag(right_track_col, hscroll_row, right_track_col, hscroll_row)
+        .unwrap();
+    harness.render().unwrap();
+    assert_eq!(
+        harness.editor().active_viewport().left_column,
+        expected_max_scroll,
+        "repeated far-end thumb drag must remain at visual max_scroll {expected_max_scroll}"
+    );
 }
 
 /// Test horizontal scrolling when moving cursor left
