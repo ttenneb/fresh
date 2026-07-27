@@ -408,6 +408,23 @@ fn sgr_mouse_is_zero_indexed() {
 }
 
 #[test]
+fn sgr_mouse_decodes_horizontal_wheel_buttons() {
+    for (button, kind) in [
+        (66, MouseEventKind::ScrollLeft),
+        (67, MouseEventKind::ScrollRight),
+    ] {
+        let mut parser = InputParser::new();
+        let sequence = format!("\x1b[<{button};10;5M");
+        let split = sequence.len() - 1;
+        assert!(parser.parse(&sequence.as_bytes()[..split]).is_empty());
+        assert!(matches!(
+            parser.parse(&sequence.as_bytes()[split..]).as_slice(),
+            [Event::Mouse(MouseEvent { kind: actual, .. })] if *actual == kind
+        ));
+    }
+}
+
+#[test]
 fn sgr_mouse_motion_without_button() {
     let mut p = InputParser::new();
     let ev = p.parse(b"\x1b[<35;10;5M");
